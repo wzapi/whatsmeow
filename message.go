@@ -417,10 +417,62 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			continue
 		} else if errors.Is(err, signalerror.ErrOldCounter) {
 			cli.Log.Warnf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
+			// WZAPI-PATCH(13): este descarte era MUDO. El mensaje se ignora y el
+			// nodo se acaba confirmando, así que no queda de él ni una fila ni un
+			// evento: para el consumidor nunca existió. Reenviarlo no arreglaría
+			// nada —el contador seguiría siendo viejo—, pero el descarte tiene que
+			// poder contarse y alertarse, que es lo que este evento permite.
+			//
+			// El resultado del handler se ignora a propósito: aquí no hay nada que
+			// reentregar, así que un handler que falle no debe retener el nodo.
+			cli.dispatchEvent(&events.UndecryptableMessage{
+				Info:            *info,
+				FailReason:      events.DecryptFailOldCounter,
+				DecryptFailMode: wzapiDecryptFailMode(ag, node),
+			})
 			continue
 		} else if err != nil {
 			cli.Log.Warnf("Error decrypting message %s from %s: %v", info.ID, info.SourceString(), err)
-			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrEventBufferDB) {
+			// WZAPI-PATCH(13): upstream (cf05480) sale aquí también ante
+			// ErrEventBufferDB, sin confirmar pero EN SILENCIO. Esa salida se
+			// separa y se aplaza a después del veredicto del llamador: sin el
+			// evento StoreUnavailable el gateway no sabe que esta sesión dejó un
+			// nodo sin confirmar, no la recicla al volver la base, y el servidor
+			// sólo reentrega al reconectar.
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				return
+			}
+			// WZAPI-PATCH(13): un almacén que no contesta NO es un fallo
+			// criptográfico, y tratarlo como tal pierde el mensaje. El camino de
+			// abajo manda hasta cinco retry receipts —presupuesto que se agota en
+			// unos diez segundos— y después confirma el nodo; un failover de la
+			// base dura minutos, así que cuando el almacén vuelve el mensaje ya
+			// está confirmado y el servidor no lo reentrega nunca.
+			//
+			// Ante el veredicto del llamador se sale SIN confirmar y sin gastar
+			// nada: es el mismo trato que ya recibe un handler que falla (el
+			// `handlerFailed` de más abajo), y por la misma razón — lo que no se
+			// pudo procesar no se confirma. El ratchet no se movió: el fallo
+			// ocurre en bufferedDecrypt, antes de tocar la sesión de Signal.
+			//
+			// Un ErrEventBufferDB es un error de almacén POR TIPO, así que con el
+			// clasificador instalado cuenta como tal aunque el sondeo del llamador
+			// diga que la base contesta (un statement_timeout, un pool agotado):
+			// upstream ya no lo confirma, y el llamador tiene que enterarse. Se le
+			// pregunta igual, primero, para que su sondeo corra.
+			if cli.DecryptStoreUnavailable != nil && (cli.DecryptStoreUnavailable(err) || errors.Is(err, ErrEventBufferDB)) {
+				cli.Log.Warnf("Not acking message %s from %s: the store is unavailable, so this is not a decryption failure — leaving the message for the server to redeliver", info.ID, info.SourceString())
+				cli.dispatchEvent(&events.UndecryptableMessage{
+					Info:             *info,
+					FailReason:       events.DecryptFailStoreUnavailable,
+					StoreUnavailable: true,
+					DecryptFailMode:  wzapiDecryptFailMode(ag, node),
+				})
+				return
+			}
+			if errors.Is(err, ErrEventBufferDB) {
+				// Upstream (cf05480): sin clasificador, el error del buffer se
+				// queda sin confirmar y sin evento, como en upstream.
 				return
 			}
 			isUnavailable := encType == "skmsg" && !containsDirectMsg && errors.Is(err, signalerror.ErrNoSenderKeyForUser)
@@ -430,8 +482,13 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				decryptFail = metaNode.AttrGetter().OptionalString("decrypt-fail")
 			}
 			evt := &events.UndecryptableMessage{
-				Info:            *info,
-				IsUnavailable:   isUnavailable,
+				Info:          *info,
+				IsUnavailable: isUnavailable,
+				// WZAPI-PATCH(13): el fallo criptográfico de siempre, con su motivo.
+				// Upstream (cf05480) ya lo despacha ANTES del ack y no confirma si
+				// el handler falla; el despacho tras el ack del parche original
+				// sobra y se retiró.
+				FailReason:      events.DecryptFailCrypto,
 				DecryptFailMode: events.DecryptFailMode(decryptFail),
 			}
 			handlerFailed := cli.dispatchEvent(evt)
@@ -529,6 +586,21 @@ func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID)
 
 var ErrEventAlreadyProcessed = errors.New("event was already processed")
 var ErrEventBufferDB = errors.New("event buffer database error")
+
+// wzapiDecryptFailMode lee decrypt-fail del <enc> y, si no está, del <meta> del
+// nodo, igual que el despacho criptográfico de upstream (8f931fd).
+//
+// WZAPI-PATCH(13): lo usan los dos UndecryptableMessage que añade el parche
+// (almacén caído y contador viejo), para que lleven el mismo modo que el de
+// upstream.
+func wzapiDecryptFailMode(ag *waBinary.AttrUtility, node *waBinary.Node) events.DecryptFailMode {
+	decryptFail := ag.OptionalString("decrypt-fail")
+	if decryptFail == "" {
+		metaNode := node.GetChildByTag("meta")
+		decryptFail = metaNode.AttrGetter().OptionalString("decrypt-fail")
+	}
+	return events.DecryptFailMode(decryptFail)
+}
 
 func (cli *Client) bufferedDecrypt(
 	ctx context.Context,
