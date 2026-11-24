@@ -643,9 +643,11 @@ func (cli *Client) bufferedDecrypt(
 		return
 	}
 
+	var decryptErr error
 	err = cli.Store.EventBuffer.DoDecryptionTxn(ctx, func(ctx context.Context) (innerErr error) {
 		plaintext, innerErr = decrypt(ctx)
 		if innerErr != nil {
+			decryptErr = innerErr
 			return
 		}
 		innerErr = cli.Store.EventBuffer.PutBufferedEvent(ctx, ciphertextHash, plaintext, serverTimestamp)
@@ -654,6 +656,17 @@ func (cli *Client) bufferedDecrypt(
 		}
 		return
 	})
+	// WZAPI-PATCH(13): un fallo al ABRIR o al CONFIRMAR la transacción de
+	// descifrado es del almacén, no de la criptografía, pero upstream no lo
+	// etiqueta: con el ping contestando, el llamador lo clasificaría como
+	// criptográfico y decryptMessages mandaría retry receipt y ack de un mensaje
+	// cuyo ratchet y cuyo buffer se deshicieron con el rollback. Se etiqueta como
+	// ErrEventBufferDB cuando el error no vino del callback de descifrado (ése
+	// conserva su propio error, que el llamador clasifica). Sólo con el
+	// clasificador instalado: nil = la conducta de upstream, intacta.
+	if err != nil && decryptErr == nil && cli.DecryptStoreUnavailable != nil && !errors.Is(err, ErrEventBufferDB) {
+		err = fmt.Errorf("%w: decryption transaction failed: %w", ErrEventBufferDB, err)
+	}
 	if err == nil {
 		zerolog.Ctx(ctx).Debug().
 			Hex("ciphertext_hash", ciphertextHash[:]).
