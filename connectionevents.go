@@ -187,7 +187,10 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 		return
 	}
 	cli.Log.Infof("Successfully authenticated")
-	cli.LastSuccessfulConnect = time.Now()
+	// WZAPI-PATCH(13): the Connected event carries its own copy of this instant
+	// (see events.Connected.AuthenticatedAt).
+	authenticatedAt := time.Now()
+	cli.LastSuccessfulConnect = authenticatedAt
 	cli.AutoReconnectErrors = 0
 	cli.isLoggedIn.Store(true)
 	ag := node.AttrGetter()
@@ -227,7 +230,7 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 		if err != nil {
 			cli.Log.Warnf("Failed to send post-connect passive IQ: %v", err)
 		}
-		cli.dispatchEvent(&events.Connected{})
+		cli.dispatchEvent(&events.Connected{AuthenticatedAt: authenticatedAt})
 		cli.closeSocketWaitChan()
 		if cli.UnifiedSessionInterval > 0 {
 			cli.sendUnifiedSession(true)

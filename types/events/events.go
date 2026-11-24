@@ -95,7 +95,16 @@ type QRScannedWithoutMultidevice struct{}
 // Connected is emitted when the client has successfully connected to the WhatsApp servers
 // and is authenticated. The user who the client is authenticated as will be in the device store
 // at this point, which is why this event doesn't contain any data.
-type Connected struct{}
+type Connected struct {
+	// WZAPI-PATCH(13): AuthenticatedAt is when the socket this event belongs to
+	// received <success> (the same instant stored in Client.LastSuccessfulConnect).
+	// The event is dispatched from a goroutine after the post-connect IQs, and the
+	// new socket may already be handling messages in that window; a handler that
+	// needs to tell "failed before this socket" from "failed on this socket" must
+	// use this copy, because reading LastSuccessfulConnect from the event races
+	// with the write of a later reconnection.
+	AuthenticatedAt time.Time
+}
 
 // KeepAliveTimeout is emitted when the keepalive ping request to WhatsApp web servers times out.
 //
